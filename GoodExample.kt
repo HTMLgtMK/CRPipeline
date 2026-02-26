@@ -111,4 +111,16 @@ fun main() {
 
     // List all users
     println("All users: ${repository.findAll()}")
+    
+    // Test: Add another user with invalid email
+    when (val result = userService.registerUser("Jane Smith", "invalid-email")) {
+        is Result.Success -> println("User registered: ${result.data}")
+        is Result.Error -> println("Registration failed: ${result.message}")
+    }
+    
+    // Test: Delete user
+    when (val result = userService.deleteUser(1)) {
+        is Result.Success -> println("User deleted successfully")
+        is Result.Error -> println("Delete failed: ${result.message}")
+    }
 }
