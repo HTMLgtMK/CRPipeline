@@ -52,14 +52,39 @@ jobs:
               }
             }')
 
+          # 输出请求内容到日志（脱敏处理）
+          echo "=== Coze API Request ==="
+          echo "Workflow ID: ${{ secrets.COZE_WORKFLOW_ID }}"
+          echo "PR Title: ${{ steps.pr-info.outputs.title }}"
+          echo "PR Number: ${{ github.event.number }}"
+          echo "Diff preview (first 500 chars):"
+          echo "${{ steps.pr-info.outputs.diff }}" | head -c 500
+          echo ""
+          echo "========================="
+
           # 调用 API
           RESPONSE=$(curl -s -X POST "https://api.coze.cn/v1/workflow/run" \
             -H "Authorization: Bearer ${{ secrets.COZE_API_TOKEN }}" \
             -H "Content-Type: application/json" \
             -d "$JSON_PAYLOAD")
 
+          # 输出原始响应到日志
+          echo "=== Coze API Raw Response ==="
+          echo "$RESPONSE" | jq '.' 2>/dev/null || echo "$RESPONSE"
+          echo "============================="
+
           # 提取工作流返回的数据（Coze 的响应结构）
-          REVIEW_DATA=$(echo "$RESPONSE" | jq -r '.data' 2>/dev/null || echo "$RESPONSE")
+          # data 字段是 JSON 字符串，需要解析两次
+          REVIEW_DATA=$(echo "$RESPONSE" | jq -r '.data' 2>/dev/null | jq -r '.output' 2>/dev/null)
+          
+          # 如果上面的解析失败，尝试直接解析
+          if [ -z "$REVIEW_DATA" ] || [ "$REVIEW_DATA" = "null" ]; then
+            REVIEW_DATA=$(echo "$RESPONSE" | jq -r '.data' 2>/dev/null || echo "$RESPONSE")
+          fi
+
+          echo "=== Parsed Review Data ==="
+          echo "$REVIEW_DATA" | jq '.' 2>/dev/null || echo "$REVIEW_DATA"
+          echo "=========================="
 
           echo "result<<COZE_EOF" >> $GITHUB_OUTPUT
           echo "$REVIEW_DATA" >> $GITHUB_OUTPUT
@@ -73,7 +98,7 @@ jobs:
           # 解析关键字段用于后续步骤
           SCORE=$(echo "$RESULT" | jq -r '.score // 0')
           CONCLUSION=$(echo "$RESULT" | jq -r '.conclusion // "warning"')
-          ERROR_COUNT=$(echo "$RESULT" | jq -r '.statistics.error_count // 0')
+          ERROR_COUNT=$(echo "$RESULT" | jq -r '.statistics.error_count // (.issues // [] | map(select(.severity == "error")) | length)')
 
           echo "score=$SCORE" >> $GITHUB_OUTPUT
           echo "conclusion=$CONCLUSION" >> $GITHUB_OUTPUT
@@ -87,8 +112,9 @@ jobs:
             // 读取 Coze 输出
             const reviewResult = ${{ steps.coze.outputs.result }};
 
-            // 验证必要字段
+            // 验证必要字段 - issues 是必需的
             if (!reviewResult.issues || !Array.isArray(reviewResult.issues)) {
+              console.error('Coze 输出:', JSON.stringify(reviewResult, null, 2));
               core.setFailed('Coze 输出格式错误：缺少 issues 字段');
               return;
             }
@@ -115,12 +141,16 @@ jobs:
               body += `### 📋 审查摘要\n${reviewResult.summary}\n\n`;
             }
 
-            // 统计信息
+            // 统计信息 - 如果没有提供则计算
             const stats = reviewResult.statistics || {};
+            const errorCount = stats.error_count ?? reviewResult.issues.filter(i => i.severity === 'error').length;
+            const warningCount = stats.warning_count ?? reviewResult.issues.filter(i => i.severity === 'warning').length;
+            const infoCount = stats.info_count ?? reviewResult.issues.filter(i => i.severity === 'info').length;
+            
             body += `### 📊 问题统计\n`;
-            body += `- ❌ 错误：${stats.error_count || 0} 个\n`;
-            body += `- ⚠️ 警告：${stats.warning_count || 0} 个\n`;
-            body += `- ℹ️ 提示：${stats.info_count || 0} 个\n\n`;
+            body += `- ❌ 错误：${errorCount} 个\n`;
+            body += `- ⚠️ 警告：${warningCount} 个\n`;
+            body += `- ℹ️ 提示：${infoCount} 个\n\n`;
 
             // 详细问题列表
             if (reviewResult.issues.length > 0) {
