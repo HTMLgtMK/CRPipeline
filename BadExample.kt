@@ -141,6 +141,11 @@ class ThreadUnsafe {
     fun getAll(): List<String> {
         return list  // Problem: Returns reference to mutable collection
     }
+    
+    // Test: Add a new method for code review testing
+    fun removeItem(item: String): Boolean {
+        return list.remove(item)
+    }
 }
 
 // Main function that will crash
