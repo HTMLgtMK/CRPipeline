@@ -152,24 +152,15 @@ jobs:
             });
             const latestCommitSha = commits[commits.length - 1].sha;
 
-            // 获取 PR 的 files 列表，用于构建文件路径映射
+            // 获取 PR 的 files 列表，用于验证文件路径
             const { data: prFiles } = await github.rest.pulls.listFiles({
               owner: context.repo.owner,
               repo: context.repo.repo,
               pull_number: context.issue.number
             });
 
-            // 构建文件映射：filename -> { additions, deletions, changes, patch }
-            const fileMap = new Map();
-            for (const file of prFiles) {
-              fileMap.set(file.filename, {
-                additions: file.additions,
-                deletions: file.deletions,
-                changes: file.changes,
-                patch: file.patch,
-                status: file.status // added, modified, removed, renamed
-              });
-            }
+            // 构建文件路径集合，用于验证
+            const filePaths = new Set(prFiles.map(f => f.filename));
 
             // 收集行级评论
             const lineComments = [];
@@ -216,78 +207,15 @@ jobs:
               }
 
               // 检查文件是否在 PR 变更中
-              const prFile = fileMap.get(issue.file);
-              if (!prFile) {
+              if (!filePaths.has(issue.file)) {
                 // 文件不在 PR 变更中，添加到汇总评论
                 const severityEmoji = { 'error': '❌', 'warning': '⚠️', 'info': 'ℹ️' }[issue.severity] || '•';
-                summaryBody += `${severityEmoji} **${issue.category || '通用'}** \`${issue.file}:${issue.line}\` - ${issue.message}\n`;
+                const lineInfo = issue.absline ? `:${issue.absline}` : '';
+                summaryBody += `${severityEmoji} **${issue.category || '通用'}** \`${issue.file}${lineInfo}\` - ${issue.message}\n`;
                 if (issue.suggestion) {
                   summaryBody += `  - 💡 建议：${issue.suggestion}\n\n`;
                 }
                 continue;
-              }
-
-              // 解析 diff patch，将绝对行号转换为 diff 中的相对位置
-              const patchLines = prFile.patch.split('\n');
-              let currentLine = 0; // 当前处理到的行号（文件中的绝对行号）
-              let position = 0; // diff 中的相对位置（从 1 开始）
-              let foundLine = -1; // 找到的目标行在 diff 中的位置
-              let inHunk = false;
-              let hunkStartLine = 0;
-              let hunkHeaderMatch = null;
-
-              // 解析 patch 头部，获取 hunk 信息
-              for (let i = 0; i < patchLines.length; i++) {
-                const line = patchLines[i];
-                
-                // 检查是否是 hunk 头部：@@ -oldStart,oldCount +newStart,newCount @@
-                const hunkMatch = line.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/);
-                if (hunkMatch) {
-                  hunkStartLine = parseInt(hunkMatch[1]);
-                  currentLine = hunkStartLine - 1;
-                  position = i + 1; // hunk 头部后的第一行
-                  inHunk = true;
-                  continue;
-                }
-
-                if (inHunk) {
-                  if (line.startsWith('+')) {
-                    // 新增的行
-                    currentLine++;
-                    position++;
-                    if (currentLine === issue.line) {
-                      foundLine = position;
-                      break;
-                    }
-                  } else if (line.startsWith('-')) {
-                    // 删除的行
-                    position++;
-                    // 删除的行不计入当前行号
-                  } else if (line.startsWith(' ') || line.startsWith('\\')) {
-                    // 上下文行（未修改）或 '\' 行
-                    currentLine++;
-                    position++;
-                    if (currentLine === issue.line) {
-                      foundLine = position;
-                      break;
-                    }
-                  }
-                }
-              }
-
-              // 如果找不到精确匹配，尝试使用绝对行号作为 position
-              if (foundLine < 0) {
-                // 使用一个启发式方法：估算位置
-                // 对于修改的文件，position 大致等于 line - hunkStartLine + 1
-                const hunkInfo = prFile.patch.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/m);
-                if (hunkInfo) {
-                  const newStartLine = parseInt(hunkInfo[1]);
-                  foundLine = issue.line - newStartLine + 1;
-                  // 确保 position 在有效范围内
-                  foundLine = Math.max(1, Math.min(foundLine, prFile.changes));
-                } else {
-                  foundLine = issue.line;
-                }
               }
 
               // 构建行级评论内容
@@ -314,10 +242,10 @@ jobs:
 
               commentBody += `---\n*由 Coze AI 自动生成*`;
 
-              // 收集行级评论
+              // 收集行级评论 - line 字段是 diff 中的相对位置
               lineComments.push({
                 path: issue.file,
-                position: foundLine,
+                position: issue.line,
                 body: commentBody,
                 side: 'RIGHT'
               });
