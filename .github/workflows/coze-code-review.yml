@@ -152,15 +152,56 @@ jobs:
             });
             const latestCommitSha = commits[commits.length - 1].sha;
 
-            // 获取 PR 的 files 列表，用于验证文件路径
+            // 获取 PR 的 files 列表和 diff 信息
             const { data: prFiles } = await github.rest.pulls.listFiles({
               owner: context.repo.owner,
               repo: context.repo.repo,
               pull_number: context.issue.number
             });
 
-            // 构建文件路径集合，用于验证
+            // 构建文件路径集合和 diff 行号映射
             const filePaths = new Set(prFiles.map(f => f.filename));
+            
+            // 为每个文件构建绝对行号到 diff position 的映射
+            const fileLineMap = new Map();
+            for (const file of prFiles) {
+              const lineMap = new Map();
+              const patch = file.patch;
+              const lines = patch.split('\n');
+              
+              let absLine = 0;  // 文件中的绝对行号（新文件）
+              let position = 0; // diff 中的相对位置
+              
+              for (let i = 0; i < lines.length; i++) {
+                const line = lines[i];
+                
+                // 解析 hunk 头部：@@ -oldStart,oldCount +newStart,newCount @@
+                const hunkMatch = line.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/);
+                if (hunkMatch) {
+                  absLine = parseInt(hunkMatch[1]) - 1;
+                  position = i;
+                  continue;
+                }
+                
+                // 处理不同类型的行
+                if (line.startsWith('+')) {
+                  // 新增的行
+                  absLine++;
+                  position++;
+                  lineMap.set(absLine, position);
+                } else if (line.startsWith('-')) {
+                  // 删除的行（不计入新文件的行号）
+                  position++;
+                } else if (line.startsWith(' ') || line.startsWith('\\')) {
+                  // 上下文行
+                  absLine++;
+                  position++;
+                  lineMap.set(absLine, position);
+                }
+              }
+              
+              fileLineMap.set(file.filename, lineMap);
+            }
 
             // 收集行级评论
             const lineComments = [];
@@ -194,10 +235,10 @@ jobs:
             summaryBody += `- ⚠️ 警告：${warningCount} 个\n`;
             summaryBody += `- ℹ️ 提示：${infoCount} 个\n\n`;
 
-            // 处理每个 issue，添加行级评论
+            // 处理每个 issue
             for (const issue of reviewResult.issues) {
               // 跳过没有文件路径或行号的问题
-              if (!issue.file || !issue.line || issue.line <= 0) {
+              if (!issue.file || !issue.absline || issue.absline <= 0) {
                 const severityEmoji = { 'error': '❌', 'warning': '⚠️', 'info': 'ℹ️' }[issue.severity] || '•';
                 summaryBody += `${severityEmoji} **${issue.category || '通用'}** - ${issue.message}\n`;
                 if (issue.suggestion) {
@@ -208,10 +249,23 @@ jobs:
 
               // 检查文件是否在 PR 变更中
               if (!filePaths.has(issue.file)) {
-                // 文件不在 PR 变更中，添加到汇总评论
                 const severityEmoji = { 'error': '❌', 'warning': '⚠️', 'info': 'ℹ️' }[issue.severity] || '•';
-                const lineInfo = issue.absline ? `:${issue.absline}` : '';
-                summaryBody += `${severityEmoji} **${issue.category || '通用'}** \`${issue.file}${lineInfo}\` - ${issue.message}\n`;
+                summaryBody += `${severityEmoji} **${issue.category || '通用'}** \`${issue.file}:${issue.absline}\` - ${issue.message}\n`;
+                if (issue.suggestion) {
+                  summaryBody += `  - 💡 建议：${issue.suggestion}\n\n`;
+                }
+                continue;
+              }
+
+              // 获取该文件的行号映射
+              const lineMap = fileLineMap.get(issue.file);
+              const diffPosition = lineMap.get(issue.absline);
+
+              // 如果找不到对应的 diff 位置，添加到汇总评论
+              if (!diffPosition || diffPosition <= 0) {
+                console.log(`Could not find diff position for ${issue.file}:${issue.absline}`);
+                const severityEmoji = { 'error': '❌', 'warning': '⚠️', 'info': 'ℹ️' }[issue.severity] || '•';
+                summaryBody += `${severityEmoji} **${issue.category || '通用'}** \`${issue.file}:${issue.absline}\` - ${issue.message}\n`;
                 if (issue.suggestion) {
                   summaryBody += `  - 💡 建议：${issue.suggestion}\n\n`;
                 }
@@ -242,10 +296,10 @@ jobs:
 
               commentBody += `---\n*由 Coze AI 自动生成*`;
 
-              // 收集行级评论 - line 字段是 diff 中的相对位置
+              // 收集行级评论
               lineComments.push({
                 path: issue.file,
-                position: issue.line,
+                position: diffPosition,
                 body: commentBody,
                 side: 'RIGHT'
               });
