@@ -127,143 +127,152 @@ jobs:
           echo "conclusion=$CONCLUSION" >> $GITHUB_OUTPUT
           echo "error_count=$ERROR_COUNT" >> $GITHUB_OUTPUT
 
-      - name: Post Review Comment
+      - name: Post Review Comments
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            // 读取 Coze 输出
             const reviewResult = ${{ steps.coze.outputs.result }};
 
-            // 验证必要字段 - issues 是必需的
+            // 验证必要字段
             if (!reviewResult.issues || !Array.isArray(reviewResult.issues)) {
               console.error('Coze 输出:', JSON.stringify(reviewResult, null, 2));
               core.setFailed('Coze 输出格式错误：缺少 issues 字段');
               return;
             }
 
-            // 构建 Markdown 评论
-            let body = `## 🔍 Coze AI 代码审查报告\n\n`;
+            // 获取 PR 的 commits 以获取最新的 commit_id
+            const { data: commits } = await github.rest.pulls.listCommits({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number
+            });
+            const latestCommitSha = commits[commits.length - 1].sha;
 
-            // 头部信息
+            // 收集行级评论
+            const lineComments = [];
+            
+            // 构建汇总评论
+            let summaryBody = `## 🔍 Coze AI 代码审查报告\n\n`;
+            
             const score = reviewResult.score || 0;
             const scoreEmoji = score >= 90 ? '🟢' : score >= 70 ? '🟡' : '🔴';
-            body += `### ${scoreEmoji} 综合评分：${score}/100\n\n`;
+            summaryBody += `### ${scoreEmoji} 综合评分：${score}/100\n\n`;
 
-            // 结论标签
             const conclusion = reviewResult.conclusion || 'warning';
             const conclusionBadge = {
               'pass': '✅ **通过** - 代码质量良好，可以合并',
               'fail': '❌ **失败** - 存在严重问题，必须修复',
               'warning': '⚠️ **警告** - 存在问题，建议修复'
             }[conclusion];
-            body += `**审查结论**：${conclusionBadge}\n\n`;
+            summaryBody += `**审查结论**：${conclusionBadge}\n\n`;
 
-            // 摘要
             if (reviewResult.summary) {
-              body += `### 📋 审查摘要\n${reviewResult.summary}\n\n`;
+              summaryBody += `### 📋 审查摘要\n${reviewResult.summary}\n\n`;
             }
 
-            // 统计信息 - 如果没有提供则计算
             const stats = reviewResult.statistics || {};
             const errorCount = stats.error_count ?? reviewResult.issues.filter(i => i.severity === 'error').length;
             const warningCount = stats.warning_count ?? reviewResult.issues.filter(i => i.severity === 'warning').length;
             const infoCount = stats.info_count ?? reviewResult.issues.filter(i => i.severity === 'info').length;
-            
-            body += `### 📊 问题统计\n`;
-            body += `- ❌ 错误：${errorCount} 个\n`;
-            body += `- ⚠️ 警告：${warningCount} 个\n`;
-            body += `- ℹ️ 提示：${infoCount} 个\n\n`;
 
-            // 详细问题列表
-            if (reviewResult.issues.length > 0) {
-              body += `### 📝 详细问题\n\n`;
+            summaryBody += `### 📊 问题统计\n`;
+            summaryBody += `- ❌ 错误：${errorCount} 个\n`;
+            summaryBody += `- ⚠️ 警告：${warningCount} 个\n`;
+            summaryBody += `- ℹ️ 提示：${infoCount} 个\n\n`;
 
-              // 按文件分组
-              const grouped = reviewResult.issues.reduce((acc, issue) => {
-                const file = issue.file || '未知文件';
-                if (!acc[file]) acc[file] = [];
-                acc[file].push(issue);
-                return acc;
-              }, {});
-
-              for (const [file, issues] of Object.entries(grouped)) {
-                body += `<details>\n<summary><b>${file}</b> (${issues.length} 个问题)</summary>\n\n`;
-
-                issues.forEach(issue => {
-                  const severityEmoji = {
-                    'error': '❌',
-                    'warning': '⚠️',
-                    'info': 'ℹ️'
-                  }[issue.severity] || '•';
-
-                  const lineInfo = issue.line ? `:${issue.line}${issue.end_line ? `-${issue.end_line}` : ''}` : '';
-
-                  body += `${severityEmoji} **${issue.category || '通用'}** \`${file}${lineInfo}\`\n\n`;
-                  body += `> ${issue.message}\n\n`;
-
-                  if (issue.suggestion) {
-                    body += `**💡 建议**：${issue.suggestion}\n\n`;
-                  }
-
-                  if (issue.code_snippet) {
-                    body += '```\n' + issue.code_snippet + '\n```\n\n';
-                  }
-
-                  if (issue.fixed_code) {
-                    body += '**✅ 修复后**：\n```\n' + issue.fixed_code + '\n```\n\n';
-                  }
-
-                  if (issue.documentation_link) {
-                    body += `📚 [查看文档](${issue.documentation_link})\n\n`;
-                  }
-
-                  body += '---\n\n';
-                });
-
-                body += '</details>\n\n';
+            // 处理每个 issue，添加行级评论
+            for (const issue of reviewResult.issues) {
+              // 跳过没有文件路径或行号的问题
+              if (!issue.file || !issue.line || issue.line <= 0) {
+                // 添加到汇总评论中
+                const severityEmoji = { 'error': '❌', 'warning': '⚠️', 'info': 'ℹ️' }[issue.severity] || '•';
+                summaryBody += `${severityEmoji} **${issue.category || '通用'}** - ${issue.message}\n`;
+                if (issue.suggestion) {
+                  summaryBody += `  - 💡 建议：${issue.suggestion}\n\n`;
+                }
+                continue;
               }
-            }
 
-            // 指标信息（可选）
-            if (reviewResult.metrics) {
-              const m = reviewResult.metrics;
-              body += `### 📈 变更指标\n`;
-              body += `- 变更文件：${m.total_files_changed || '-'} 个\n`;
-              body += `- 新增代码：${m.lines_added || '-'} 行\n`;
-              body += `- 删除代码：${m.lines_removed || '-'} 行\n`;
-              if (m.complexity_score) body += `- 复杂度评分：${m.complexity_score}\n`;
-              body += `\n`;
-            }
+              // 构建行级评论内容
+              let commentBody = `**${issue.severity.toUpperCase()}** - ${issue.category || '通用'}\n\n`;
+              commentBody += `${issue.message}\n\n`;
+              
+              if (issue.suggestion) {
+                commentBody += `💡 **建议**:\n${issue.suggestion}\n\n`;
+              }
 
-            body += `\n---\n*⏱️ 分析耗时：${reviewResult.time_cost?.total_time_ms || '-'}ms | 由 Coze AI 自动生成*`;
+              if (issue.code_snippet) {
+                const lang = issue.file.split('.').pop() || '';
+                commentBody += `**原始代码**:\n\`\`\`${lang}\n${issue.code_snippet}\n\`\`\`\n\n`;
+              }
 
-            // 查找现有评论
-            const { data: comments } = await github.rest.issues.listComments({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number
-            });
+              if (issue.fixed_code) {
+                const lang = issue.file.split('.').pop() || '';
+                commentBody += `✅ **修复后**:\n\`\`\`${lang}\n${issue.fixed_code}\n\`\`\`\n\n`;
+              }
 
-            const botComment = comments.find(c =>
-              c.user.type === 'Bot' &&
-              c.body.includes('Coze AI 代码审查报告')
-            );
+              if (issue.documentation_link) {
+                commentBody += `📚 [查看文档](${issue.documentation_link})\n\n`;
+              }
 
-            if (botComment) {
-              await github.rest.issues.updateComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                comment_id: botComment.id,
-                body: body
+              commentBody += `---\n*由 Coze AI 自动生成*`;
+
+              // 收集行级评论
+              lineComments.push({
+                path: issue.file,
+                position: issue.line,
+                body: commentBody,
+                side: 'RIGHT'
               });
-            } else {
+            }
+
+            // 如果没有行级评论，只添加汇总评论
+            if (lineComments.length === 0) {
+              summaryBody += `\n✅ 本次提交未发现需要行级评论的问题。`;
+              
               await github.rest.issues.createComment({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 issue_number: context.issue.number,
-                body: body
+                body: summaryBody
               });
+              return;
+            }
+
+            // 创建 PR Review（包含行级评论和汇总评论）
+            summaryBody += `\n---\n*⏱️ 分析耗时：${reviewResult.time_cost?.total_time_ms || '-'}ms | 由 Coze AI 自动生成*`;
+
+            const reviewPayload = {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+              commit_id: latestCommitSha,
+              body: summaryBody,
+              event: 'COMMENT',
+              comments: lineComments
+            };
+
+            console.log('Creating review with', lineComments.length, 'line comments');
+            
+            try {
+              await github.rest.pulls.createReview(reviewPayload);
+              console.log('Review created successfully');
+            } catch (error) {
+              console.error('Failed to create review:', error);
+              
+              // 如果创建行级评论失败，回退到普通评论
+              if (error.status === 422 || error.status === 404) {
+                console.log('Falling back to issue comment');
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.issue.number,
+                  body: summaryBody + '\n\n（行级评论创建失败，可能因为文件已修改或行号不匹配）'
+                });
+              } else {
+                throw error;
+              }
             }
 
       - name: Check Conclusion
