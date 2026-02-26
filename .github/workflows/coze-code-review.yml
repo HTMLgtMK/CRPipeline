@@ -1,0 +1,220 @@
+name: Coze Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  coze-review:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get PR Info
+        id: pr-info
+        run: |
+          # 获取 PR 基本信息
+          echo "title=${{ github.event.pull_request.title }}" >> $GITHUB_OUTPUT
+          echo "body=${{ github.event.pull_request.body }}" >> $GITHUB_OUTPUT
+
+          # 获取 diff（限制大小）
+          DIFF=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3.diff" \
+            "${{ github.event.pull_request.diff_url }}" | head -c 50000)
+          echo "diff<<EOF" >> $GITHUB_OUTPUT
+          echo "$DIFF" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Call Coze API
+        id: coze
+        run: |
+          # 构造请求
+          JSON_PAYLOAD=$(jq -n \
+            --arg workflow_id "${{ secrets.COZE_WORKFLOW_ID }}" \
+            --arg title "${{ steps.pr-info.outputs.title }}" \
+            --arg body "${{ steps.pr-info.outputs.body }}" \
+            --arg diff "${{ steps.pr-info.outputs.diff }}" \
+            --arg pr_number "${{ github.event.number }}" \
+            '{
+              workflow_id: $workflow_id,
+              parameters: {
+                pr_title: $title,
+                pr_description: $body,
+                diff_content: $diff,
+                pr_number: $pr_number
+              }
+            }')
+
+          # 调用 API
+          RESPONSE=$(curl -s -X POST "https://api.coze.cn/v1/workflow/run" \
+            -H "Authorization: Bearer ${{ secrets.COZE_API_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "$JSON_PAYLOAD")
+
+          # 提取工作流返回的数据（Coze 的响应结构）
+          REVIEW_DATA=$(echo "$RESPONSE" | jq -r '.data' 2>/dev/null || echo "$RESPONSE")
+
+          echo "result<<COZE_EOF" >> $GITHUB_OUTPUT
+          echo "$REVIEW_DATA" >> $GITHUB_OUTPUT
+          echo "COZE_EOF" >> $GITHUB_OUTPUT
+
+      - name: Process Review Result
+        id: process
+        run: |
+          RESULT='${{ steps.coze.outputs.result }}'
+
+          # 解析关键字段用于后续步骤
+          SCORE=$(echo "$RESULT" | jq -r '.score // 0')
+          CONCLUSION=$(echo "$RESULT" | jq -r '.conclusion // "warning"')
+          ERROR_COUNT=$(echo "$RESULT" | jq -r '.statistics.error_count // 0')
+
+          echo "score=$SCORE" >> $GITHUB_OUTPUT
+          echo "conclusion=$CONCLUSION" >> $GITHUB_OUTPUT
+          echo "error_count=$ERROR_COUNT" >> $GITHUB_OUTPUT
+
+      - name: Post Review Comment
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            // 读取 Coze 输出
+            const reviewResult = ${{ steps.coze.outputs.result }};
+
+            // 验证必要字段
+            if (!reviewResult.issues || !Array.isArray(reviewResult.issues)) {
+              core.setFailed('Coze 输出格式错误：缺少 issues 字段');
+              return;
+            }
+
+            // 构建 Markdown 评论
+            let body = `## 🔍 Coze AI 代码审查报告\n\n`;
+
+            // 头部信息
+            const score = reviewResult.score || 0;
+            const scoreEmoji = score >= 90 ? '🟢' : score >= 70 ? '🟡' : '🔴';
+            body += `### ${scoreEmoji} 综合评分：${score}/100\n\n`;
+
+            // 结论标签
+            const conclusion = reviewResult.conclusion || 'warning';
+            const conclusionBadge = {
+              'pass': '✅ **通过** - 代码质量良好，可以合并',
+              'fail': '❌ **失败** - 存在严重问题，必须修复',
+              'warning': '⚠️ **警告** - 存在问题，建议修复'
+            }[conclusion];
+            body += `**审查结论**：${conclusionBadge}\n\n`;
+
+            // 摘要
+            if (reviewResult.summary) {
+              body += `### 📋 审查摘要\n${reviewResult.summary}\n\n`;
+            }
+
+            // 统计信息
+            const stats = reviewResult.statistics || {};
+            body += `### 📊 问题统计\n`;
+            body += `- ❌ 错误：${stats.error_count || 0} 个\n`;
+            body += `- ⚠️ 警告：${stats.warning_count || 0} 个\n`;
+            body += `- ℹ️ 提示：${stats.info_count || 0} 个\n\n`;
+
+            // 详细问题列表
+            if (reviewResult.issues.length > 0) {
+              body += `### 📝 详细问题\n\n`;
+
+              // 按文件分组
+              const grouped = reviewResult.issues.reduce((acc, issue) => {
+                const file = issue.file || '未知文件';
+                if (!acc[file]) acc[file] = [];
+                acc[file].push(issue);
+                return acc;
+              }, {});
+
+              for (const [file, issues] of Object.entries(grouped)) {
+                body += `<details>\n<summary><b>${file}</b> (${issues.length} 个问题)</summary>\n\n`;
+
+                issues.forEach(issue => {
+                  const severityEmoji = {
+                    'error': '❌',
+                    'warning': '⚠️',
+                    'info': 'ℹ️'
+                  }[issue.severity] || '•';
+
+                  const lineInfo = issue.line ? `:${issue.line}${issue.end_line ? `-${issue.end_line}` : ''}` : '';
+
+                  body += `${severityEmoji} **${issue.category || '通用'}** \`${file}${lineInfo}\`\n\n`;
+                  body += `> ${issue.message}\n\n`;
+
+                  if (issue.suggestion) {
+                    body += `**💡 建议**：${issue.suggestion}\n\n`;
+                  }
+
+                  if (issue.code_snippet) {
+                    body += '```\n' + issue.code_snippet + '\n```\n\n';
+                  }
+
+                  if (issue.fixed_code) {
+                    body += '**✅ 修复后**：\n```\n' + issue.fixed_code + '\n```\n\n';
+                  }
+
+                  if (issue.documentation_link) {
+                    body += `📚 [查看文档](${issue.documentation_link})\n\n`;
+                  }
+
+                  body += '---\n\n';
+                });
+
+                body += '</details>\n\n';
+              }
+            }
+
+            // 指标信息（可选）
+            if (reviewResult.metrics) {
+              const m = reviewResult.metrics;
+              body += `### 📈 变更指标\n`;
+              body += `- 变更文件：${m.total_files_changed || '-'} 个\n`;
+              body += `- 新增代码：${m.lines_added || '-'} 行\n`;
+              body += `- 删除代码：${m.lines_removed || '-'} 行\n`;
+              if (m.complexity_score) body += `- 复杂度评分：${m.complexity_score}\n`;
+              body += `\n`;
+            }
+
+            body += `\n---\n*⏱️ 分析耗时：${reviewResult.time_cost?.total_time_ms || '-'}ms | 由 Coze AI 自动生成*`;
+
+            // 查找现有评论
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number
+            });
+
+            const botComment = comments.find(c =>
+              c.user.type === 'Bot' &&
+              c.body.includes('Coze AI 代码审查报告')
+            );
+
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: body
+              });
+            }
+
+      - name: Check Conclusion
+        if: ${{ steps.process.outputs.conclusion == 'fail' }}
+        run: |
+          echo "::error::代码审查未通过，存在严重问题"
+          exit 1
