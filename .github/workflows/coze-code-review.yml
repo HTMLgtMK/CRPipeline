@@ -28,14 +28,14 @@ jobs:
           BODY_ESCAPED=$(printf '%s' "$BODY" | tr '\n' ' ' | tr '"' "'")
           echo "body=${BODY_ESCAPED}" >> $GITHUB_OUTPUT
 
-          # 获取 diff 并 base64 编码避免特殊字符问题
-          DIFF=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Accept: application/vnd.github.v3.diff" \
-            "${{ github.event.pull_request.diff_url }}" | head -c 50000)
+          # 使用 gh CLI 获取 diff（自动使用 GITHUB_TOKEN 认证）
+          DIFF=$(gh pr diff ${{ github.event.pull_request.number }} | head -c 50000)
           DIFF_ENCODED=$(printf '%s' "$DIFF" | base64 -w 0)
           echo "diff_encoded=${DIFF_ENCODED}" >> $GITHUB_OUTPUT
           echo "diff_length=${#DIFF}" >> $GITHUB_OUTPUT
           echo "Diff length: ${#DIFF}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Call Coze API
         id: coze
