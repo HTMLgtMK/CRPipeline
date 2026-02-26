@@ -22,25 +22,33 @@ jobs:
         run: |
           # 获取 PR 基本信息
           echo "title=${{ github.event.pull_request.title }}" >> $GITHUB_OUTPUT
-          echo "body=${{ github.event.pull_request.body }}" >> $GITHUB_OUTPUT
+          
+          # 处理 PR body，替换换行符和特殊字符
+          BODY="${{ github.event.pull_request.body }}"
+          BODY_ESCAPED=$(printf '%s' "$BODY" | tr '\n' ' ' | tr '"' "'")
+          echo "body=${BODY_ESCAPED}" >> $GITHUB_OUTPUT
 
-          # 获取 diff（限制大小）
+          # 获取 diff 并 base64 编码避免特殊字符问题
           DIFF=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
             -H "Accept: application/vnd.github.v3.diff" \
             "${{ github.event.pull_request.diff_url }}" | head -c 50000)
-          echo "diff<<EOF" >> $GITHUB_OUTPUT
-          echo "$DIFF" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+          DIFF_ENCODED=$(printf '%s' "$DIFF" | base64 -w 0)
+          echo "diff_encoded=${DIFF_ENCODED}" >> $GITHUB_OUTPUT
+          echo "diff_length=${#DIFF}" >> $GITHUB_OUTPUT
+          echo "Diff length: ${#DIFF}"
 
       - name: Call Coze API
         id: coze
         run: |
+          # 解码 diff
+          DIFF_DECODED=$(echo "${{ steps.pr-info.outputs.diff_encoded }}" | base64 -d)
+          
           # 构造请求
           JSON_PAYLOAD=$(jq -n \
             --arg workflow_id "${{ secrets.COZE_WORKFLOW_ID }}" \
             --arg title "${{ steps.pr-info.outputs.title }}" \
             --arg body "${{ steps.pr-info.outputs.body }}" \
-            --arg diff "${{ steps.pr-info.outputs.diff }}" \
+            --arg diff "$DIFF_DECODED" \
             --arg pr_number "${{ github.event.number }}" \
             '{
               workflow_id: $workflow_id,
@@ -57,8 +65,9 @@ jobs:
           echo "Workflow ID: ${{ secrets.COZE_WORKFLOW_ID }}"
           echo "PR Title: ${{ steps.pr-info.outputs.title }}"
           echo "PR Number: ${{ github.event.number }}"
+          echo "Diff length: ${{ steps.pr-info.outputs.diff_length }}"
           echo "Diff preview (first 500 chars):"
-          echo "${{ steps.pr-info.outputs.diff }}" | head -c 500
+          echo "$DIFF_DECODED" | head -c 500
           echo ""
           echo "========================="
 
@@ -75,11 +84,25 @@ jobs:
 
           # 提取工作流返回的数据（Coze 的响应结构）
           # data 字段是 JSON 字符串，需要解析两次
-          REVIEW_DATA=$(echo "$RESPONSE" | jq -r '.data' 2>/dev/null | jq -r '.output' 2>/dev/null)
+          # 完整结构：{code, msg, data: "{output: {...}}"}
+          RAW_DATA=$(echo "$RESPONSE" | jq -r '.data' 2>/dev/null)
           
-          # 如果上面的解析失败，尝试直接解析
+          # 解析 data 字段（是 JSON 字符串）
+          PARSED_DATA=$(echo "$RAW_DATA" | jq -r '.' 2>/dev/null)
+          
+          # 提取 output 字段（可能是字符串或对象）
+          OUTPUT_FIELD=$(echo "$PARSED_DATA" | jq -r '.output' 2>/dev/null)
+          
+          # 如果 output 是字符串，需要再次解析
+          if echo "$OUTPUT_FIELD" | jq -e 'type == "string"' > /dev/null 2>&1; then
+            REVIEW_DATA=$(echo "$OUTPUT_FIELD" | jq -r '.' 2>/dev/null)
+          else
+            REVIEW_DATA="$OUTPUT_FIELD"
+          fi
+          
+          # 如果上面的解析失败，尝试直接使用 output
           if [ -z "$REVIEW_DATA" ] || [ "$REVIEW_DATA" = "null" ]; then
-            REVIEW_DATA=$(echo "$RESPONSE" | jq -r '.data' 2>/dev/null || echo "$RESPONSE")
+            REVIEW_DATA=$(echo "$PARSED_DATA" | jq -r '.output' 2>/dev/null || echo "$RAW_DATA")
           fi
 
           echo "=== Parsed Review Data ==="
