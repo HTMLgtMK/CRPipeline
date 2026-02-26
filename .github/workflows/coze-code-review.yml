@@ -300,8 +300,7 @@ jobs:
               lineComments.push({
                 path: issue.file,
                 position: diffPosition,
-                body: commentBody,
-                side: 'RIGHT'
+                body: commentBody
               });
             }
 
